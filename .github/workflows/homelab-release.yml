@@ -112,7 +112,8 @@ jobs:
       - name: Checkout synced tree
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: ${{ needs.detect-and-sync.outputs.release_tag }}
+          # master (not the upstream tag) — fork CI scripts live only on master after sync
+          ref: master
           fetch-depth: 1
 
       - name: Validate required secrets
