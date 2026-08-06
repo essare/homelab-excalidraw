@@ -1,0 +1,174 @@
+# Homelab: detect latest upstream Excalidraw release → build/push private image.
+#
+# Strategy: the Docker image is built directly from the upstream release tag's
+# tree. We do NOT merge upstream releases into the fork's `master`. The fork's
+# CI patch script is brought into the release tree via a second, sparse
+# checkout of the fork's `master` (path `.ci-fork`, restricted to
+# `.github/scripts`), copied into `.github/scripts/`, and the temporary
+# `.ci-fork` directory is removed before the Docker build so it never pollutes
+# the build context. The same release tag is optionally pushed to the fork
+# (origin) for provenance/traceability only.
+#
+# Required repository secrets:
+#   PRIVATE_CR              - registry host (no scheme), e.g. registry.example.com
+#   PRIVATE_CR_USERNAME     - registry username
+#   PRIVATE_CR_PASSWORD     - registry password/token
+#   WS_SERVER_URL           - VITE_APP_WS_SERVER_URL value for production build
+#   FIREBASE_CONFIGURATION  - raw JSON object for VITE_APP_FIREBASE_CONFIG (no wrapping quotes)
+#
+# Env overrides are applied only on the runner before docker build and are NEVER committed.
+name: Homelab Release Sync & Publish
+
+on:
+  schedule:
+    - cron: "0 6 * * 0" # Sundays 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild and push even if this release tag already exists on the fork"
+        type: boolean
+        default: false
+
+concurrency:
+  group: homelab-release
+  cancel-in-progress: false
+
+jobs:
+  detect-and-sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      should_build: ${{ steps.plan.outputs.should_build }}
+      release_tag: ${{ steps.plan.outputs.release_tag }}
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve latest upstream release and ensure tag on fork
+        id: plan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force == true }}
+        run: |
+          set -euo pipefail
+
+          RELEASE_TAG="$(gh api repos/excalidraw/excalidraw/releases/latest --jq .tag_name)"
+          if [[ -z "${RELEASE_TAG}" || "${RELEASE_TAG}" == "null" ]]; then
+            echo "error: could not resolve upstream latest release tag" >&2
+            exit 1
+          fi
+          echo "Upstream latest release: ${RELEASE_TAG}"
+
+          TAG_ON_ORIGIN="false"
+          if git ls-remote --exit-code --tags origin "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+            TAG_ON_ORIGIN="true"
+          fi
+          echo "Tag on origin: ${TAG_ON_ORIGIN}; force: ${FORCE}"
+
+          if [[ "${TAG_ON_ORIGIN}" == "true" && "${FORCE}" != "true" ]]; then
+            echo "Release ${RELEASE_TAG} already on fork; skipping build."
+            echo "should_build=false" >> "${GITHUB_OUTPUT}"
+            echo "release_tag=" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if [[ "${TAG_ON_ORIGIN}" == "true" && "${FORCE}" == "true" ]]; then
+            echo "Force rebuild for existing tag ${RELEASE_TAG}; tag already on origin."
+            echo "should_build=true" >> "${GITHUB_OUTPUT}"
+            echo "release_tag=${RELEASE_TAG}" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          # Tag missing on origin: fetch it from upstream and push it to the
+          # fork for provenance only. This does NOT merge the release into
+          # master — the image is built from this tag's tree directly.
+          git remote add upstream https://github.com/excalidraw/excalidraw.git 2>/dev/null || git remote set-url upstream https://github.com/excalidraw/excalidraw.git
+          git fetch upstream "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          git push origin "refs/tags/${RELEASE_TAG}"
+
+          echo "should_build=true" >> "${GITHUB_OUTPUT}"
+          echo "release_tag=${RELEASE_TAG}" >> "${GITHUB_OUTPUT}"
+
+  build-and-push:
+    needs: detect-and-sync
+    if: needs.detect-and-sync.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout upstream release tree
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.detect-and-sync.outputs.release_tag }}
+          fetch-depth: 1
+
+      - name: Checkout fork CI scripts (sparse)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: master
+          fetch-depth: 1
+          path: .ci-fork
+          sparse-checkout: |
+            .github/scripts
+
+      - name: Copy fork patch script into release tree
+        run: |
+          set -euo pipefail
+          mkdir -p .github/scripts
+          cp .ci-fork/.github/scripts/patch-env-production.py .github/scripts/
+          rm -rf .ci-fork
+
+      - name: Validate required secrets
+        env:
+          WS_SERVER_URL: ${{ secrets.WS_SERVER_URL }}
+          FIREBASE_CONFIGURATION: ${{ secrets.FIREBASE_CONFIGURATION }}
+          PRIVATE_CR: ${{ secrets.PRIVATE_CR }}
+          PRIVATE_CR_USERNAME: ${{ secrets.PRIVATE_CR_USERNAME }}
+          PRIVATE_CR_PASSWORD: ${{ secrets.PRIVATE_CR_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in WS_SERVER_URL FIREBASE_CONFIGURATION PRIVATE_CR PRIVATE_CR_USERNAME PRIVATE_CR_PASSWORD; do
+            if [[ -z "${!name}" ]]; then
+              echo "error: secret ${name} is empty or not set" >&2
+              missing=1
+            fi
+          done
+          exit "${missing}"
+
+      - name: Patch .env.production for build (workspace only)
+        env:
+          WS_SERVER_URL: ${{ secrets.WS_SERVER_URL }}
+          FIREBASE_CONFIGURATION: ${{ secrets.FIREBASE_CONFIGURATION }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/patch-env-production.py .env.production
+          # This is the upstream release tree (no fork git history), so there
+          # is nothing to commit/push here; the patched file only ever exists
+          # in this ephemeral runner workspace.
+          git status --porcelain
+          # Explicitly do not git add / commit / push
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Login to private registry
+        uses: docker/login-action@465a07811f14bebb1938fbed4728c6a1ff8901fc # v2
+        with:
+          registry: ${{ secrets.PRIVATE_CR }}
+          username: ${{ secrets.PRIVATE_CR_USERNAME }}
+          password: ${{ secrets.PRIVATE_CR_PASSWORD }}
+
+      - name: Build and push
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ secrets.PRIVATE_CR }}/homelab/excalidraw:${{ needs.detect-and-sync.outputs.release_tag }}
+            ${{ secrets.PRIVATE_CR }}/homelab/excalidraw:latest
