@@ -1,5 +1,26 @@
 # Homelab Release Sync & Docker Publish Implementation Plan
 
+> **Amendment (2026-08-06, post-review — strategy A):** A whole-branch review
+> found the original `detect-and-sync` design (merge upstream release into
+> fork `master`, then build from `master`) risked merge conflicts and
+> force-push on a recurring cron job. Adopted fix: **do not** merge upstream
+> into `master`. `detect-and-sync` now only resolves the latest upstream tag
+> and, if missing on `origin`, pushes that tag straight from `upstream` to
+> `origin` for provenance (no merge/checkout/pull). `build-and-push` now
+> checks out the **upstream release tag tree** directly, then does a second
+> sparse checkout of fork `master` (path `.ci-fork`, `sparse-checkout:
+> .github/scripts`) to bring in `patch-env-production.py`, copies it into
+> `.github/scripts/` in the release tree, and deletes `.ci-fork` before
+> `docker build` (the `Dockerfile` does `COPY . .`, so a leftover `.ci-fork`
+> would otherwise land in the image). `contents: write` permission is now
+> scoped to `detect-and-sync` only; `build-and-push` runs with `contents:
+> read`. A `concurrency` group (`homelab-release`, `cancel-in-progress:
+> false`) was added to prevent overlapping runs. See the amended design doc
+> (`docs/superpowers/specs/2026-08-06-homelab-release-workflow-design.md`)
+> for full details. The embedded YAML in Task 2 below reflects the
+> **original** (superseded) design and is kept for historical reference only
+> — the actual workflow file in the repo follows the amendment above.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add a GitHub Actions workflow that weekly syncs the latest upstream Excalidraw release into this fork and publishes an amd64 Docker image to the private registry with CI-only env overrides.
