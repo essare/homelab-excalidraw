@@ -64,6 +64,13 @@ class PatchEnvProductionTests(unittest.TestCase):
             result = self.run_patch(path, "", '{"apiKey":"x"}')
             self.assertNotEqual(result.returncode, 0)
 
+    def test_rejects_empty_firebase(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / ".env.production"
+            path.write_text(SAMPLE, encoding="utf-8")
+            result = self.run_patch(path, "https://example.com", "")
+            self.assertNotEqual(result.returncode, 0)
+
     def test_rejects_invalid_firebase_json(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / ".env.production"
