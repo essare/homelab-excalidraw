@@ -1,0 +1,168 @@
+# Homelab: sync latest upstream Excalidraw release → build/push private image.
+#
+# Required repository secrets:
+#   PRIVATE_CR              - registry host (no scheme), e.g. registry.example.com
+#   PRIVATE_CR_USERNAME     - registry username
+#   PRIVATE_CR_PASSWORD     - registry password/token
+#   WS_SERVER_URL           - VITE_APP_WS_SERVER_URL value for production build
+#   FIREBASE_CONFIGURATION  - raw JSON object for VITE_APP_FIREBASE_CONFIG (no wrapping quotes)
+#
+# Env overrides are applied only on the runner before docker build and are NEVER committed.
+name: Homelab Release Sync & Publish
+
+on:
+  schedule:
+    - cron: "0 6 * * 0" # Sundays 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild and push even if this release tag already exists on the fork"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  detect-and-sync:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.plan.outputs.should_build }}
+      release_tag: ${{ steps.plan.outputs.release_tag }}
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Resolve latest upstream release and sync
+        id: plan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force == true }}
+        run: |
+          set -euo pipefail
+
+          RELEASE_TAG="$(gh api repos/excalidraw/excalidraw/releases/latest --jq .tag_name)"
+          if [[ -z "${RELEASE_TAG}" || "${RELEASE_TAG}" == "null" ]]; then
+            echo "error: could not resolve upstream latest release tag" >&2
+            exit 1
+          fi
+          echo "Upstream latest release: ${RELEASE_TAG}"
+
+          git remote add upstream https://github.com/excalidraw/excalidraw.git 2>/dev/null || git remote set-url upstream https://github.com/excalidraw/excalidraw.git
+          git fetch upstream "refs/tags/${RELEASE_TAG}:refs/tags/upstream-${RELEASE_TAG}"
+          # Also fetch the real tag name locally for merge if missing
+          if ! git rev-parse -q --verify "refs/tags/${RELEASE_TAG}" >/dev/null; then
+            git fetch upstream "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          fi
+
+          TAG_ON_ORIGIN="false"
+          if git ls-remote --exit-code --tags origin "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+            TAG_ON_ORIGIN="true"
+          fi
+          echo "Tag on origin: ${TAG_ON_ORIGIN}; force: ${FORCE}"
+
+          if [[ "${TAG_ON_ORIGIN}" == "true" && "${FORCE}" != "true" ]]; then
+            echo "Release ${RELEASE_TAG} already on fork; skipping sync and build."
+            echo "should_build=false" >> "${GITHUB_OUTPUT}"
+            echo "release_tag=" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if [[ "${TAG_ON_ORIGIN}" == "true" && "${FORCE}" == "true" ]]; then
+            echo "Force rebuild for existing tag ${RELEASE_TAG}; skipping git sync."
+            echo "should_build=true" >> "${GITHUB_OUTPUT}"
+            echo "release_tag=${RELEASE_TAG}" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          git checkout master
+          git pull --ff-only origin master
+
+          if git merge-base --is-ancestor "${RELEASE_TAG}" HEAD; then
+            echo "master already contains ${RELEASE_TAG}; ensuring tag is pushed."
+          else
+            if git merge --ff-only "${RELEASE_TAG}"; then
+              echo "Fast-forwarded master to ${RELEASE_TAG}"
+            else
+              git merge --no-ff -m "chore: sync upstream release ${RELEASE_TAG}" "${RELEASE_TAG}"
+            fi
+            git push origin master
+          fi
+
+          if ! git ls-remote --exit-code --tags origin "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+            git push origin "refs/tags/${RELEASE_TAG}"
+          fi
+
+          echo "should_build=true" >> "${GITHUB_OUTPUT}"
+          echo "release_tag=${RELEASE_TAG}" >> "${GITHUB_OUTPUT}"
+
+  build-and-push:
+    needs: detect-and-sync
+    if: needs.detect-and-sync.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout synced tree
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ needs.detect-and-sync.outputs.release_tag }}
+          fetch-depth: 1
+
+      - name: Validate required secrets
+        env:
+          WS_SERVER_URL: ${{ secrets.WS_SERVER_URL }}
+          FIREBASE_CONFIGURATION: ${{ secrets.FIREBASE_CONFIGURATION }}
+          PRIVATE_CR: ${{ secrets.PRIVATE_CR }}
+          PRIVATE_CR_USERNAME: ${{ secrets.PRIVATE_CR_USERNAME }}
+          PRIVATE_CR_PASSWORD: ${{ secrets.PRIVATE_CR_PASSWORD }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in WS_SERVER_URL FIREBASE_CONFIGURATION PRIVATE_CR PRIVATE_CR_USERNAME PRIVATE_CR_PASSWORD; do
+            if [[ -z "${!name}" ]]; then
+              echo "error: secret ${name} is empty or not set" >&2
+              missing=1
+            fi
+          done
+          exit "${missing}"
+
+      - name: Patch .env.production for build (workspace only)
+        env:
+          WS_SERVER_URL: ${{ secrets.WS_SERVER_URL }}
+          FIREBASE_CONFIGURATION: ${{ secrets.FIREBASE_CONFIGURATION }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/patch-env-production.py .env.production
+          # Prove we did not stage anything for commit (safety check)
+          if ! git diff --quiet -- .env.production; then
+            echo "env file patched in workspace (expected; will NOT be committed)"
+          fi
+          git status --porcelain
+          # Explicitly do not git add / commit / push
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Login to private registry
+        uses: docker/login-action@465a07811f14bebb1938fbed4728c6a1ff8901fc # v2
+        with:
+          registry: ${{ secrets.PRIVATE_CR }}
+          username: ${{ secrets.PRIVATE_CR_USERNAME }}
+          password: ${{ secrets.PRIVATE_CR_PASSWORD }}
+
+      - name: Build and push
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ secrets.PRIVATE_CR }}/homelab/excalidraw:${{ needs.detect-and-sync.outputs.release_tag }}
+            ${{ secrets.PRIVATE_CR }}/homelab/excalidraw:latest
