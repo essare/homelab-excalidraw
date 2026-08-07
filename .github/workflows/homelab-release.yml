@@ -153,6 +153,20 @@ jobs:
           git status --porcelain
           # Explicitly do not git add / commit / push
 
+      # Upstream release tags like v0.18.1 still ship Dockerfile FROM node:18, but
+      # current dependency resolution (e.g. marked@16) requires Node >= 20.
+      - name: Bump Dockerfile Node base for release-tag builds
+        run: |
+          set -euo pipefail
+          if grep -qE '^FROM[[:space:]]+node:18([[:space:]]|AS|$)' Dockerfile; then
+            sed -i -E 's/^FROM[[:space:]]+node:18([[:space:]]|AS|$)/FROM node:20\1/' Dockerfile
+            echo "Updated Dockerfile base image node:18 -> node:20"
+            head -n 5 Dockerfile
+          else
+            echo "Dockerfile does not use FROM node:18; leaving as-is"
+            head -n 5 Dockerfile
+          fi
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
