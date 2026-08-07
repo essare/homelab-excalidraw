@@ -1,13 +1,12 @@
 # Homelab: detect latest upstream Excalidraw release → build/push private image.
 #
-# Strategy: the Docker image is built directly from the upstream release tag's
-# tree. We do NOT merge upstream releases into the fork's `master`. The fork's
-# CI patch script is brought into the release tree via a second, sparse
-# checkout of the fork's `master` (path `.ci-fork`, restricted to
-# `.github/scripts`), copied into `.github/scripts/`, and the temporary
-# `.ci-fork` directory is removed before the Docker build so it never pollutes
-# the build context. The same release tag is optionally pushed to the fork
-# (origin) for provenance/traceability only.
+# Strategy: the Docker image is built directly from excalidraw/excalidraw at the
+# upstream release tag (not from a merge into this fork's master). The fork's
+# CI patch script is brought into that tree via a second, sparse checkout of
+# this repo's master (path `.ci-fork`, restricted to `.github/scripts`), copied
+# into `.github/scripts/`, and `.ci-fork` is removed before docker build.
+# The same release tag is pushed to this fork for provenance (requires
+# workflows: write because upstream tags include .github/workflows files).
 #
 # Required repository secrets:
 #   PRIVATE_CR              - registry host (no scheme), e.g. registry.example.com
@@ -38,6 +37,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      # Required to push tags whose trees include .github/workflows/* (GitHub rejects
+      # GITHUB_TOKEN tag pushes that introduce workflow files without this).
+      workflows: write
     outputs:
       should_build: ${{ steps.plan.outputs.should_build }}
       release_tag: ${{ steps.plan.outputs.release_tag }}
@@ -85,7 +87,7 @@ jobs:
 
           # Tag missing on origin: fetch it from upstream and push it to the
           # fork for provenance only. This does NOT merge the release into
-          # master — the image is built from this tag's tree directly.
+          # master — the image is built from excalidraw/excalidraw @ tag.
           git remote add upstream https://github.com/excalidraw/excalidraw.git 2>/dev/null || git remote set-url upstream https://github.com/excalidraw/excalidraw.git
           git fetch upstream "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
           git push origin "refs/tags/${RELEASE_TAG}"
@@ -100,15 +102,19 @@ jobs:
     permissions:
       contents: read
     steps:
+      # Checkout the upstream release directly so the build does not depend on
+      # the provenance tag existing on this fork.
       - name: Checkout upstream release tree
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
+          repository: excalidraw/excalidraw
           ref: ${{ needs.detect-and-sync.outputs.release_tag }}
           fetch-depth: 1
 
       - name: Checkout fork CI scripts (sparse)
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
+          repository: ${{ github.repository }}
           ref: master
           fetch-depth: 1
           path: .ci-fork
