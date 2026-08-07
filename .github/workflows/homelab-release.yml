@@ -5,8 +5,11 @@
 # CI patch script is brought into that tree via a second, sparse checkout of
 # this repo's master (path `.ci-fork`, restricted to `.github/scripts`), copied
 # into `.github/scripts/`, and `.ci-fork` is removed before docker build.
-# The same release tag is pushed to this fork for provenance (requires
-# workflows: write because upstream tags include .github/workflows files).
+#
+# Idempotency: skip when ${PRIVATE_CR}/homelab/excalidraw:<tag> already exists
+# (unless workflow_dispatch force=true). We do NOT push provenance tags to the
+# fork — GITHUB_TOKEN cannot push tags whose trees include .github/workflows
+# files, and `permissions.workflows` is not a valid Actions permission key.
 #
 # Required repository secrets:
 #   PRIVATE_CR              - registry host (no scheme), e.g. registry.example.com
@@ -24,7 +27,7 @@ on:
   workflow_dispatch:
     inputs:
       force:
-        description: "Rebuild and push even if this release tag already exists on the fork"
+        description: "Rebuild and push even if this release image already exists in the registry"
         type: boolean
         default: false
 
@@ -36,25 +39,19 @@ jobs:
   detect-and-sync:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-      # Required to push tags whose trees include .github/workflows/* (GitHub rejects
-      # GITHUB_TOKEN tag pushes that introduce workflow files without this).
-      workflows: write
+      contents: read
     outputs:
       should_build: ${{ steps.plan.outputs.should_build }}
       release_tag: ${{ steps.plan.outputs.release_tag }}
     steps:
-      - name: Checkout fork
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          fetch-depth: 1
-          token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Resolve latest upstream release and ensure tag on fork
+      - name: Resolve latest upstream release
         id: plan
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force == true }}
+          PRIVATE_CR: ${{ secrets.PRIVATE_CR }}
+          PRIVATE_CR_USERNAME: ${{ secrets.PRIVATE_CR_USERNAME }}
+          PRIVATE_CR_PASSWORD: ${{ secrets.PRIVATE_CR_PASSWORD }}
         run: |
           set -euo pipefail
 
@@ -65,33 +62,32 @@ jobs:
           fi
           echo "Upstream latest release: ${RELEASE_TAG}"
 
-          TAG_ON_ORIGIN="false"
-          if git ls-remote --exit-code --tags origin "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
-            TAG_ON_ORIGIN="true"
-          fi
-          echo "Tag on origin: ${TAG_ON_ORIGIN}; force: ${FORCE}"
-
-          if [[ "${TAG_ON_ORIGIN}" == "true" && "${FORCE}" != "true" ]]; then
-            echo "Release ${RELEASE_TAG} already on fork; skipping build."
-            echo "should_build=false" >> "${GITHUB_OUTPUT}"
-            echo "release_tag=" >> "${GITHUB_OUTPUT}"
-            exit 0
+          if [[ -z "${PRIVATE_CR}" || -z "${PRIVATE_CR_USERNAME}" || -z "${PRIVATE_CR_PASSWORD}" ]]; then
+            echo "error: PRIVATE_CR / PRIVATE_CR_USERNAME / PRIVATE_CR_PASSWORD must be set" >&2
+            exit 1
           fi
 
-          if [[ "${TAG_ON_ORIGIN}" == "true" && "${FORCE}" == "true" ]]; then
-            echo "Force rebuild for existing tag ${RELEASE_TAG}; tag already on origin."
+          IMAGE="${PRIVATE_CR}/homelab/excalidraw:${RELEASE_TAG}"
+          echo "Checking registry for existing image: ${IMAGE}"
+          echo "force: ${FORCE}"
+
+          if [[ "${FORCE}" == "true" ]]; then
+            echo "Force rebuild requested."
             echo "should_build=true" >> "${GITHUB_OUTPUT}"
             echo "release_tag=${RELEASE_TAG}" >> "${GITHUB_OUTPUT}"
             exit 0
           fi
 
-          # Tag missing on origin: fetch it from upstream and push it to the
-          # fork for provenance only. This does NOT merge the release into
-          # master — the image is built from excalidraw/excalidraw @ tag.
-          git remote add upstream https://github.com/excalidraw/excalidraw.git 2>/dev/null || git remote set-url upstream https://github.com/excalidraw/excalidraw.git
-          git fetch upstream "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
-          git push origin "refs/tags/${RELEASE_TAG}"
+          echo "${PRIVATE_CR_PASSWORD}" | docker login "${PRIVATE_CR}" -u "${PRIVATE_CR_USERNAME}" --password-stdin
 
+          if docker buildx imagetools inspect "${IMAGE}" >/dev/null 2>&1; then
+            echo "Image ${IMAGE} already exists; skipping build."
+            echo "should_build=false" >> "${GITHUB_OUTPUT}"
+            echo "release_tag=" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          echo "Image not found in registry; will build."
           echo "should_build=true" >> "${GITHUB_OUTPUT}"
           echo "release_tag=${RELEASE_TAG}" >> "${GITHUB_OUTPUT}"
 
@@ -102,8 +98,6 @@ jobs:
     permissions:
       contents: read
     steps:
-      # Checkout the upstream release directly so the build does not depend on
-      # the provenance tag existing on this fork.
       - name: Checkout upstream release tree
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
