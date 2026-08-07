@@ -156,6 +156,51 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
+      # Temporary: distinguish Cloudflare block vs Zot authz (does not print secrets)
+      - name: Diagnose registry reachability from Actions
+        env:
+          PRIVATE_CR: ${{ secrets.PRIVATE_CR }}
+          PRIVATE_CR_USERNAME: ${{ secrets.PRIVATE_CR_USERNAME }}
+          PRIVATE_CR_PASSWORD: ${{ secrets.PRIVATE_CR_PASSWORD }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          cr = os.environ["PRIVATE_CR"]
+          u = os.environ["PRIVATE_CR_USERNAME"]
+          p = os.environ["PRIVATE_CR_PASSWORD"]
+          print(f"registry={cr!r}")
+          print(f"username={u!r}")
+          print(f"password_len={len(p)}")
+          print(f"password_has_slash={'/' in p}")
+          print(f"password_has_trailing_ws={p != p.strip()}")
+          PY
+
+          echo "--- anonymous GET /v2/ ---"
+          curl -sS -m 20 -D /tmp/anon.hdr -o /tmp/anon.body \
+            -A "docker/24.0.0 go/1.20.7 git-commit/abcdef linux/amd64" \
+            "https://${PRIVATE_CR}/v2/" || true
+          echo "status=$(awk 'NR==1{print $2}' /tmp/anon.hdr)"
+          rg -i "^(HTTP/|content-type:|www-authenticate:|cf-|server:)" /tmp/anon.hdr || true
+          echo "body:"
+          head -c 300 /tmp/anon.body; echo
+
+          echo "--- basic-auth GET /v2/ ---"
+          curl -sS -m 20 -D /tmp/auth.hdr -o /tmp/auth.body \
+            -u "${PRIVATE_CR_USERNAME}:${PRIVATE_CR_PASSWORD}" \
+            -A "docker/24.0.0 go/1.20.7 git-commit/abcdef linux/amd64" \
+            "https://${PRIVATE_CR}/v2/" || true
+          echo "status=$(awk 'NR==1{print $2}' /tmp/auth.hdr)"
+          rg -i "^(HTTP/|content-type:|www-authenticate:|cf-|server:)" /tmp/auth.hdr || true
+          echo "body:"
+          head -c 300 /tmp/auth.body; echo
+
+          echo "--- docker login via stdin (same as CI, not login-action) ---"
+          set +e
+          echo "${PRIVATE_CR_PASSWORD}" | docker login "${PRIVATE_CR}" -u "${PRIVATE_CR_USERNAME}" --password-stdin
+          echo "docker_login_exit=$?"
+          set -e
+
       - name: Login to private registry
         uses: docker/login-action@465a07811f14bebb1938fbed4728c6a1ff8901fc # v2
         with:
