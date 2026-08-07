@@ -158,8 +158,8 @@ jobs:
       - name: Bump Dockerfile Node base for release-tag builds
         run: |
           set -euo pipefail
-          if grep -qE '^FROM[[:space:]]+node:18([[:space:]]|AS|$)' Dockerfile; then
-            sed -i -E 's/^FROM[[:space:]]+node:18([[:space:]]|AS|$)/FROM node:20\1/' Dockerfile
+          if grep -qE '^FROM[[:space:]]+node:18([[:space:]]|$)' Dockerfile; then
+            sed -i 's/^FROM node:18/FROM node:20/' Dockerfile
             echo "Updated Dockerfile base image node:18 -> node:20"
             head -n 5 Dockerfile
           else
